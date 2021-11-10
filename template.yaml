@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Access your VPC private resources (e.g. Aurora, RDS, OpenSearch) trough AWS Session Manager
+
+Parameters:
+  ImageId:
+    Description: Amazon Linux 2
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs
+
+  TargetHost:
+    Description: Target host of a private resource (e.g. OpenSearch Domain endpoint)
+    Type: String
+
+  TargetPort:
+    Description: Target port of a private resource (e.g. port 443 for OpenSearch)
+    Type: String
+
+  TargetSecurityGroup:
+    Description: Security Group of a private resource
+    Type: AWS::EC2::SecurityGroup::Id
+
+  SOCATPORT:
+    Description: Source port for AWS Session Manager to establish tunnel
+    Type: String
+    Default: 9200
+
+  VPC:
+    Type: AWS::EC2::VPC::Id
+
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+
+  Owner:
+    Type: String
+
+Mappings:
+  Configuration:
+    Strings:
+      Name: on-aws-vpc-tunnel
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Group for Tunnel instance
+      VpcId:  !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+  PrivateResourceSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow traffic from tunnel to a private resource
+      GroupId: !Ref TargetSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref TargetPort
+      ToPort: !Ref TargetPort
+      SourceSecurityGroupId: !Ref SecurityGroup
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Effect: Allow
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref InstanceRole
+
+  UserDataHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: !FindInMap [Configuration, Strings, Name]
+            - Key: Owner
+              Value: !Ref Owner
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            MaxPrice: 0.2
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !FindInMap [Configuration, Strings, Name]
+              - Key: Owner
+                Value: !Ref Owner
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !FindInMap [Configuration, Strings, Name]
+              - Key: Owner
+                Value: !Ref Owner
+          - ResourceType: spot-instances-request
+            Tags:
+              - Key: Name
+                Value: !FindInMap [Configuration, Strings, Name]
+              - Key: Owner
+                Value: !Ref Owner
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/bin/bash
+              export instance=`curl http://169.254.169.254/latest/meta-data/instance-id`
+              /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchTemplate --region ${AWS::Region}
+              /opt/aws/bin/cfn-signal '${UserDataHandle}'
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              socat: []
+          files:
+            /etc/systemd/system/on-aws-forward.service:
+              content: !Sub |
+                [Unit]
+                Description=Socat forward to OpenSearch
+                [Service]
+                User=ec2-user
+                WorkingDirectory=/home/ec2-user
+                ExecStart=/usr/bin/socat TCP-LISTEN:${SOCATPORT},fork,reuseaddr TCP:${TargetHost}:${TargetPort}
+                SuccessExitStatus=143
+                TimeoutStopSec=10
+                Restart=on-failure
+                RestartSec=5
+                [Install]
+                WantedBy=multi-user.target
+          commands:
+            01_forward:
+              command: |
+                systemctl daemon-reload
+                systemctl enable on-aws-forward.service
+                systemctl start on-aws-forward.service
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: t3.nano
+      SubnetId: !Select [ 0, !Ref PrivateSubnets ]
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+
+  WaitUserData:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: Instance
+    Properties:
+      Handle: !Ref UserDataHandle
+      Timeout: 600
+
+Outputs:
+  CreateSSMSession:
+    Value: !Sub aws ssm start-session --target ${Instance} --document-name AWS-StartPortForwardingSession --parameters '{"portNumber":["${SOCATPORT}"], "localPortNumber":["8888"]}'
