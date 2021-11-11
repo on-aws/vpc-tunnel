@@ -53,6 +53,10 @@ Resources:
           FromPort: 443
           ToPort: 443
           CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: !Ref TargetPort
+          ToPort: !Ref TargetPort
+          SourceSecurityGroupId: !Ref TargetSecurityGroup
       Tags:
         - Key: Owner
           Value: !Ref Owner
@@ -83,7 +87,7 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-      
+
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
@@ -185,4 +189,4 @@ Resources:
 
 Outputs:
   CreateSSMSession:
-    Value: !Sub aws ssm start-session --target ${Instance} --document-name AWS-StartPortForwardingSession --parameters '{"portNumber":["${SOCATPORT}"], "localPortNumber":["8888"]}'
+    Value: !Sub aws ssm start-session --target ${Instance} --document-name AWS-StartPortForwardingSession --parameters '{"portNumber":["${SOCATPORT}"], "localPortNumber":["${TargetPort}"]}'
